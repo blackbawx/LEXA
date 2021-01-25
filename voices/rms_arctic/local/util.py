@@ -749,6 +749,7 @@ def collate_fn_lexa(batch):
 
     # Add single zeros frame at least, so plus 1
     max_target_len = np.max([len(x[1]) for x in batch]) + 1
+    max_target_len = 540
     if max_target_len % r != 0:
         max_target_len += r - max_target_len % r
         assert max_target_len % r == 0

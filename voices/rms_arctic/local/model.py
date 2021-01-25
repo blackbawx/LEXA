@@ -50,8 +50,12 @@ class AttentionWrapperLexa(nn.Module):
             alignment.data.masked_fill_(mask, self.score_mask_value)
 
         # Normalize attention weight
-        alignment = F.softmax(alignment,dim=-1)
+        latent_classes = torch.argmax(alignment, dim=-1)
+        #print("Shape of alignment: ", alignment.shape, amax)
+        #sys.exit()
 
+        alignment = F.softmax(alignment,dim=-1)
+      
         # Attention context vector
         # (batch, 1, dim)
         attention = torch.bmm(alignment.unsqueeze(1), memory)
@@ -59,7 +63,7 @@ class AttentionWrapperLexa(nn.Module):
         # (batch, dim)
         attention = attention.squeeze(1)
 
-        return cell_output, attention, alignment
+        return cell_output, attention, alignment, latent_classes
 
 
 class Decoder_TacotronOneSeqwise(Decoder_TacotronOne):
@@ -102,7 +106,7 @@ class LexaAttention(nn.Module):
 
 
 class Decoder_Lexa(Decoder_TacotronOneSeqwise):
-    def __init__(self, in_dim, r):
+    def __init__(self, in_dim, r, num_encoder_states):
         super(Decoder_Lexa, self).__init__(in_dim, r)
 
         self.attention_rnn = AttentionWrapperLexa(
@@ -110,10 +114,12 @@ class Decoder_Lexa(Decoder_TacotronOneSeqwise):
             LexaAttention(256)
             )
 
+        self.num_encoder_states = num_encoder_states
+
     def forward(self, encoder_outputs, inputs=None, memory_lengths=None, tau=None):
 
         assert tau is not None
-        print("The value of tau in decoder: ", tau)
+        #print("The value of tau in decoder: ", tau)
 
         B = encoder_outputs.size(0)
 
@@ -153,6 +159,7 @@ class Decoder_Lexa(Decoder_TacotronOneSeqwise):
 
         outputs = []
         alignments = []
+        classes = []
 
         t = 0
 
@@ -170,7 +177,7 @@ class Decoder_Lexa(Decoder_TacotronOneSeqwise):
             current_input = self.prenet(current_input)
 
             # Attention RNN
-            attention_rnn_hidden, current_attention, alignment = self.attention_rnn(
+            attention_rnn_hidden, current_attention, alignment, latent_classes = self.attention_rnn(
                 current_input, current_attention, attention_rnn_hidden,
                 encoder_outputs, processed_memory=processed_memory, mask=mask, tau=tau)
 
@@ -190,6 +197,7 @@ class Decoder_Lexa(Decoder_TacotronOneSeqwise):
 
             outputs += [output]
             alignments += [alignment]
+            classes += [latent_classes]
 
             t += 1
 
@@ -208,8 +216,15 @@ class Decoder_Lexa(Decoder_TacotronOneSeqwise):
         # Back to batch first
         alignments = torch.stack(alignments).transpose(0, 1)
         outputs = torch.stack(outputs).transpose(0, 1).contiguous()
+        classes = torch.cat(classes, dim=0)
+        #print("Shape of classes: ", classes.shape)
 
-        return outputs, alignments
+        # Entropy
+        hist = classes.float().cpu().histc(bins=self.num_encoder_states, min=-0.5, max=1.5)
+        probs = hist.masked_select(hist > 0) / len(classes)
+        entropy = - (probs * probs.log()).sum().item()
+        
+        return outputs, alignments, entropy, ' '.join(str(k) for k in classes.cpu().numpy().tolist())
 
 
 class TacotronOneSeqwise(TacotronOne):
@@ -447,7 +462,7 @@ class LexatronDownsampled(TacotronLexa):
             ]
         self.encoder = DownsamplingEncoderStrict(mel_dim, encoder_layers,use_batchnorm=1)
         self.mel_fc = nn.Linear(mel_dim, 256)
-        self.decoder = Decoder_Lexa(mel_dim, r)
+        self.decoder = Decoder_Lexa(mel_dim, r, 68)
 
     def forward(self, targets=None, input_lengths=None, steps=None):
 
@@ -461,15 +476,17 @@ class LexatronDownsampled(TacotronLexa):
 
         memory_lengths = None
         tau = anneal_tau(steps)
-        print("The value of tau is ", tau)
-        mel_outputs, alignments = self.decoder(
+        #print("The value of tau is ", tau)
+        mel_outputs, alignments, entropy, classes = self.decoder(
             encoder_outputs, targets, memory_lengths=memory_lengths, tau=tau)
+        #print("Entropy is ", entropy)
+        #sys.exit()
 
         mel_outputs = mel_outputs.view(B, -1, self.mel_dim)
 
         linear_outputs = self.postnet(mel_outputs)
         linear_outputs = self.last_linear(linear_outputs)
 
-        return mel_outputs, linear_outputs, alignments, tau
+        return mel_outputs, linear_outputs, alignments, tau, entropy, classes
 
 

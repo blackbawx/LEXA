@@ -86,6 +86,8 @@ def train(model, train_loader, val_loader, optimizer,
     while global_epoch < nepochs:
         h = open(logfile_name, 'a')
         running_loss = 0.
+        running_entropy = 0.
+
         for step, (input_lengths, mel, y) in tqdm(enumerate(train_loader)):
 
             # Decay learning rate
@@ -113,7 +115,7 @@ def train(model, train_loader, val_loader, optimizer,
                mel_outputs, linear_outputs, attn = outputs[0], outputs[1], outputs[2]
  
             else:
-                mel_outputs, linear_outputs, attn, tau = model(mel, input_lengths=sorted_lengths, steps = global_step)
+                mel_outputs, linear_outputs, attn, tau, entropy, classes = model(mel, input_lengths=sorted_lengths, steps = global_step)
 
             # Loss
             mel_loss = criterion(mel_outputs, mel)
@@ -147,6 +149,7 @@ def train(model, train_loader, val_loader, optimizer,
             #log_value("learning rate", current_lr, global_step)
             log_histogram("Last Linear Weights", model.last_linear.weight.detach().cpu(), global_step)
             global_step += 1
+            running_entropy += entropy
             running_loss += loss.item()
 
             if use_assistant and assistant is not None:
@@ -155,6 +158,9 @@ def train(model, train_loader, val_loader, optimizer,
               assistant.log_scalar("Linear Loss", float(linear_loss.item()))
               assistant.log_scalar("Gradient Norm", float(grad_norm))
               assistant.log_scalar("Tau", float(tau))
+              assistant.log_scalar("Average Entropy", float(running_entropy/global_step))
+              assistant.log_scalar("Entropy", float(entropy))
+              assistant.log_text('latents', classes)
 
               #assistant.log_scalar("Learning Rate", float(current_lr))
 
@@ -231,7 +237,7 @@ if __name__ == "__main__":
         collate_fn=collate_fn_lexa, pin_memory=hparams.pin_memory)
 
     # Model
-    model = Tacotron(n_vocab=1+ len(ph_ids),
+    model = Tacotron(n_vocab=1+len(ph_ids),
                      embedding_dim=256,
                      mel_dim=hparams.num_mels,
                      linear_dim=hparams.num_freq,
@@ -254,8 +260,8 @@ if __name__ == "__main__":
         model.load_state_dict(checkpoint["state_dict"])
         optimizer.load_state_dict(checkpoint["optimizer"])
         try:
-            global_step = checkpoint["global_step"]
-            global_epoch = checkpoint["global_epoch"]
+            global_step = int(checkpoint["global_step"])
+            global_epoch = int(checkpoint["global_epoch"])
         except:
             # TODO
             pass

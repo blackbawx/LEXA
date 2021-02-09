@@ -292,12 +292,35 @@ def visualize_phone_embeddings(model, checkpoints_dir, step):
 
 ### Misc
 def visualize_latent_embeddings(model, checkpoints_dir, step):
-    return
     print("Computing TSNE")
-    latent_embedding = model.quantizer.embedding0.squeeze(0).detach().cpu().numpy()
-    num_classes = model.num_classes
+    latent_embedding = model.vq.embedding.squeeze(0).detach().cpu().numpy()
+    num_classes = model.num_latentclasses
 
-    ppl_array = [5, 10, 40, 100, 200]
+    ppl_array = [5 ] #, 10, 40, 100, 200]
+    for ppl in ppl_array:
+
+       embedding = TSNE(n_components=2, verbose=1, perplexity=ppl).fit_transform(latent_embedding)
+
+       y = embedding[:,0]
+       z = embedding[:,1]
+
+       fig, ax = plt.subplots()
+       ax.scatter(y, z)
+
+       for i  in range(num_classes):
+          ax.annotate(i, (y[i], z[i]))
+
+       path = checkpoints_dir + '/step' + str(step).zfill(7) + '_latent_embedding_perplexity_' + str(ppl) + '.png'
+       plt.tight_layout()
+       plt.savefig(path, format="png")
+       plt.close()
+
+def visualize_latent_embedding0(model, checkpoints_dir, step):
+    print("Computing TSNE")
+    latent_embedding = model.vq.embedding0.squeeze(0).detach().cpu().numpy()
+    num_classes = model.num_latentclasses
+
+    ppl_array = [5 ] #, 10, 40, 100, 200]
     for ppl in ppl_array:
 
        embedding = TSNE(n_components=2, verbose=1, perplexity=ppl).fit_transform(latent_embedding)
@@ -315,6 +338,7 @@ def visualize_latent_embeddings(model, checkpoints_dir, step):
        plt.tight_layout()
        plt.savefig(path, format="png")
        plt.close()
+
 
 def collate_fn_transformer(batch):
     """Create batch"""
@@ -749,7 +773,7 @@ def collate_fn_lexa(batch):
 
     # Add single zeros frame at least, so plus 1
     max_target_len = np.max([len(x[1]) for x in batch]) + 1
-    max_target_len = 540
+    #max_target_len = 544
     if max_target_len % r != 0:
         max_target_len += r - max_target_len % r
         assert max_target_len % r == 0

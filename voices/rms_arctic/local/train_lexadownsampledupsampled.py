@@ -32,7 +32,7 @@ from utils import audio
 from utils.plot import plot_alignment
 from tqdm import tqdm, trange
 from util import *
-from model import LexatronDownsampled as Tacotron
+from model import LexatronDownsampledUpsampled as Tacotron
 from judith.experiment_tracking import RemoteTracker
 
 
@@ -81,12 +81,11 @@ def train(model, train_loader, val_loader, optimizer,
     linear_dim = model.linear_dim
 
     criterion = nn.L1Loss()
-
+    running_entropy = 0.
     global global_step, global_epoch
     while global_epoch < nepochs:
         h = open(logfile_name, 'a')
         running_loss = 0.
-        running_entropy = 0.
 
         for step, (input_lengths, mel, y) in tqdm(enumerate(train_loader)):
 
@@ -115,9 +114,11 @@ def train(model, train_loader, val_loader, optimizer,
                mel_outputs, linear_outputs, attn = outputs[0], outputs[1], outputs[2]
  
             else:
-                mel_outputs, linear_outputs, attn, tau, entropy, classes = model(mel, input_lengths=sorted_lengths, steps = global_step)
+                mel_outputs, linear_outputs, tau, entropy, classes = model(mel, input_lengths=sorted_lengths, steps = global_step)
 
             # Loss
+            #mel = mel[:,1:,:]
+            #y = y[:, 1:, :]  
             mel_loss = criterion(mel_outputs, mel)
             n_priority_freq = int(3000 / (fs * 0.5) * linear_dim)
             linear_loss = 0.5 * criterion(linear_outputs, y) \
@@ -126,10 +127,10 @@ def train(model, train_loader, val_loader, optimizer,
             loss = mel_loss + linear_loss
 
             if global_step > 0 and global_step % hparams.save_states_interval == 0:
-                save_states(
-                    global_step, mel_outputs, linear_outputs, attn, y,
-                    None, checkpoint_dir)
-                visualize_phone_embeddings(model, checkpoint_dir, global_step)
+                #save_states(
+                #    global_step, mel_outputs, linear_outputs, attn, y,
+                #    None, checkpoint_dir)
+                visualize_latent_embeddings(model, checkpoint_dir, global_step)
 
             if global_step > 0 and global_step % checkpoint_interval == 0:
                 save_checkpoint(
@@ -239,7 +240,7 @@ if __name__ == "__main__":
     # Model
     model = Tacotron(n_vocab=1+len(ph_ids),
                      embedding_dim=256,
-                     num_latentclasses=64,
+                     num_latentclasses=128,
                      mel_dim=hparams.num_mels,
                      linear_dim=hparams.num_freq,
                      r=hparams.outputs_per_step,

@@ -32,7 +32,7 @@ from utils import audio
 from utils.plot import plot_alignment
 from tqdm import tqdm, trange
 from util import *
-from model import LexatronDownsampled as Tacotron
+from model import LexatronDownsampledVQConventional as Tacotron
 from judith.experiment_tracking import RemoteTracker
 
 
@@ -68,7 +68,7 @@ fs = hparams.sample_rate
 
 
 use_assistant = 1
-
+normalize_latents = True
 
 
 def train(model, train_loader, val_loader, optimizer,
@@ -81,12 +81,12 @@ def train(model, train_loader, val_loader, optimizer,
     linear_dim = model.linear_dim
 
     criterion = nn.L1Loss()
+    running_entropy = 0.
 
     global global_step, global_epoch
     while global_epoch < nepochs:
         h = open(logfile_name, 'a')
         running_loss = 0.
-        running_entropy = 0.
 
         for step, (input_lengths, mel, y) in tqdm(enumerate(train_loader)):
 
@@ -115,7 +115,7 @@ def train(model, train_loader, val_loader, optimizer,
                mel_outputs, linear_outputs, attn = outputs[0], outputs[1], outputs[2]
  
             else:
-                mel_outputs, linear_outputs, attn, tau, entropy, classes = model(mel, input_lengths=sorted_lengths, steps = global_step)
+                mel_outputs, linear_outputs, attn, entropy, classes, vq_penalty, encoder_penalty = model(mel)
 
             # Loss
             mel_loss = criterion(mel_outputs, mel)
@@ -123,13 +123,15 @@ def train(model, train_loader, val_loader, optimizer,
             linear_loss = 0.5 * criterion(linear_outputs, y) \
                 + 0.5 * criterion(linear_outputs[:, :, :n_priority_freq],
                                   y[:, :, :n_priority_freq])
-            loss = mel_loss + linear_loss
+            encoder_weight = 0.25 * min(1, max(0.1, global_step / 1000 - 1)) # https://github.com/mkotha/WaveRNN/blob/74b839b57a7e128b3f8f0b4eb224156c1e5e175d/models/vqvae.py#L209
+
+            loss = mel_loss + linear_loss + vq_penalty + encoder_penalty * encoder_weight 
 
             if global_step > 0 and global_step % hparams.save_states_interval == 0:
                 save_states(
                     global_step, mel_outputs, linear_outputs, attn, y,
                     None, checkpoint_dir)
-                visualize_phone_embeddings(model, checkpoint_dir, global_step)
+                #visualize_latent_embedding0(model, checkpoint_dir, global_step)
 
             if global_step > 0 and global_step % checkpoint_interval == 0:
                 save_checkpoint(
@@ -140,6 +142,8 @@ def train(model, train_loader, val_loader, optimizer,
             grad_norm = torch.nn.utils.clip_grad_norm_(
                  model.parameters(), clip_thresh)
             optimizer.step()
+            if normalize_latents:
+               model.vq.after_update()
 
             # Logs
             log_value("loss", float(loss.item()), global_step)
@@ -151,13 +155,17 @@ def train(model, train_loader, val_loader, optimizer,
             global_step += 1
             running_entropy += entropy
             running_loss += loss.item()
+            classes = ' '.join(str(k) for k in classes.cpu().detach().numpy().tolist())
+            #print("Latents: ", classes)
 
             if use_assistant and assistant is not None:
+              assistant.log_scalar("Encoder Penalty", encoder_penalty)
+              assistant.log_scalar("Encoder Weight", encoder_weight)
+              assistant.log_scalar("VQ Penalty", vq_penalty)
               assistant.log_scalar("loss", float(loss.item()))
               assistant.log_scalar("Mel Loss", float(mel_loss.item()))
               assistant.log_scalar("Linear Loss", float(linear_loss.item()))
               assistant.log_scalar("Gradient Norm", float(grad_norm))
-              assistant.log_scalar("Tau", float(tau))
               assistant.log_scalar("Average Entropy", float(running_entropy/global_step))
               assistant.log_scalar("Entropy", float(entropy))
               assistant.log_text('latents', classes)
@@ -245,6 +253,7 @@ if __name__ == "__main__":
                      r=hparams.outputs_per_step,
                      padding_idx=hparams.padding_idx,
                      use_memory_mask=hparams.use_memory_mask,
+                     normalize_latents=normalize_latents
                      )
     model = model.cuda()
     #model = DataParallelFix(model)

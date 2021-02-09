@@ -32,7 +32,7 @@ from utils import audio
 from utils.plot import plot_alignment
 from tqdm import tqdm, trange
 from util import *
-from model import LexatronDownsampled as Tacotron
+from model import LexatronDownsampledVQSoftmaxFinalframe as Tacotron
 from judith.experiment_tracking import RemoteTracker
 
 
@@ -68,7 +68,7 @@ fs = hparams.sample_rate
 
 
 use_assistant = 1
-
+mel_noise=0
 
 
 def train(model, train_loader, val_loader, optimizer,
@@ -81,12 +81,12 @@ def train(model, train_loader, val_loader, optimizer,
     linear_dim = model.linear_dim
 
     criterion = nn.L1Loss()
+    running_entropy = 0.
 
     global global_step, global_epoch
     while global_epoch < nepochs:
         h = open(logfile_name, 'a')
         running_loss = 0.
-        running_entropy = 0.
 
         for step, (input_lengths, mel, y) in tqdm(enumerate(train_loader)):
 
@@ -117,6 +117,7 @@ def train(model, train_loader, val_loader, optimizer,
             else:
                 mel_outputs, linear_outputs, attn, tau, entropy, classes = model(mel, input_lengths=sorted_lengths, steps = global_step)
 
+            classes = ' '.join(str(k) for k in classes.cpu().detach().numpy().tolist())
             # Loss
             mel_loss = criterion(mel_outputs, mel)
             n_priority_freq = int(3000 / (fs * 0.5) * linear_dim)
@@ -129,7 +130,7 @@ def train(model, train_loader, val_loader, optimizer,
                 save_states(
                     global_step, mel_outputs, linear_outputs, attn, y,
                     None, checkpoint_dir)
-                visualize_phone_embeddings(model, checkpoint_dir, global_step)
+                visualize_latent_embeddings(model, checkpoint_dir, global_step)
 
             if global_step > 0 and global_step % checkpoint_interval == 0:
                 save_checkpoint(
@@ -244,6 +245,7 @@ if __name__ == "__main__":
                      linear_dim=hparams.num_freq,
                      r=hparams.outputs_per_step,
                      padding_idx=hparams.padding_idx,
+                     mel_noise=mel_noise,
                      use_memory_mask=hparams.use_memory_mask,
                      )
     model = model.cuda()

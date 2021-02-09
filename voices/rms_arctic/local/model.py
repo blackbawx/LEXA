@@ -4,6 +4,7 @@ FALCON_DIR = os.environ.get('FALCONDIR')
 sys.path.append(FALCON_DIR)
 
 from models import *
+from blocks import *
 from layers import *
 from util import *
 
@@ -11,6 +12,13 @@ from util import *
 def anneal_tau(steps):
   factor = 1e-5
   return max(0.1, float(np.exp(-1 * factor * steps)))
+
+
+def sample_gumbel(x, eps=1e-20):
+    U = torch.rand(x.shape)
+    U = U.cuda()
+    return -torch.log(-torch.log(U + eps) + eps)
+
 
 class AttentionWrapperLexa(nn.Module):
     def __init__(self, rnn_cell, attention_mechanism,
@@ -78,10 +86,6 @@ class LexaAttention(nn.Module):
         self.tanh = nn.Tanh() 
         self.v = nn.Linear(dim, 1, bias=False) 
  
-    def anneal_tau(self, steps):
-        factor = 1e-5
-        return max(0.1, float(np.exp(-1 * factor * steps)))
-
     def forward(self, query, processed_memory, tau): 
         """ 
         Args: 
@@ -103,6 +107,58 @@ class LexaAttention(nn.Module):
 
         # (batch, max_time) 
         return alignment.squeeze(-1)
+
+
+class LexaVQSoftmax(nn.Module): 
+    def __init__(self, dim, num_classes): 
+        super(LexaVQSoftmax, self).__init__() 
+        self.query_layer = nn.Linear(dim, dim, bias=False) 
+        self.tanh = nn.Tanh() 
+        self.v = nn.Linear(dim, 1, bias=False) 
+        self.embedding = nn.Parameter(torch.randn(num_classes, dim, requires_grad=True))  
+        self.num_classes = num_classes
+
+    def forward(self, processed_memory, tau): 
+        """ 
+        Args: 
+            query: (batch, 1, dim) or (batch, dim) 
+            processed_memory: (batch, max_time, dim) 
+            steps: num_steps 
+        """ 
+ 
+        assert tau is not None
+        embedding = self.embedding
+        x = processed_memory
+ 
+        # (batch, 1, dim) 
+        processed_memory = self.query_layer(processed_memory) 
+        processed_memory = processed_memory.view(-1, 1, processed_memory.shape[-1]) 
+        #print("Shape of processed memory: ", processed_memory.shape)
+
+        embedding = embedding.expand(processed_memory.shape[1], -1, processed_memory.shape[-1])
+        #print("Shape of embedding: ", embedding.shape)
+   
+        # (batch, max_time, 1) 
+        alignment = self.v(self.tanh(embedding + processed_memory)) 
+        alignment =  alignment + sample_gumbel(alignment)
+
+        latents = torch.argmax(alignment/tau, dim=1)
+        attn = torch.softmax(alignment/tau,dim=1) 
+        #print("Shape of attn and latents: ", attn.shape, latents.shape)
+        embedding = self.embedding.expand(processed_memory.shape[0], -1, processed_memory.shape[-1])
+        #print("Shape of embedding: ", embedding.shape)
+        attn = torch.bmm(attn.transpose(1,2), embedding)
+        #print("Shape of attn and latents: ", attn.shape, latents.shape)
+
+        # Entropy
+        latents = latents.view(-1).float().cpu()
+        hist = latents.histc(bins=self.num_classes, min=-0.5, max=self.num_classes - 0.5)
+        probs = hist.masked_select(hist > 0) / len(latents)
+        entropy = - (probs * probs.log()).sum().item()
+
+        # (batch, max_time) 
+        #return attn.view(x.shape), ' '.join(str(int(k)) for k in latents.numpy()), entropy
+        return attn.view(x.shape), latents, entropy
 
 
 class Decoder_Lexa(Decoder_TacotronOneSeqwise):
@@ -231,8 +287,8 @@ class TacotronOneSeqwise(TacotronOne):
 
     def __init__(self, n_vocab, embedding_dim=256, mel_dim=80, linear_dim=1025,
                  r=5, padding_idx=None, use_memory_mask=False):
-        super(TacotronOneSeqwise, self).__init__(n_vocab, embedding_dim=256, mel_dim=80, linear_dim=1025,
-                 r=5, padding_idx=None, use_memory_mask=False)
+        super(TacotronOneSeqwise, self).__init__(n_vocab, embedding_dim, mel_dim, linear_dim,
+                 r, padding_idx, use_memory_mask)
         self.decoder = Decoder_TacotronOneSeqwise(mel_dim, r)
 
 
@@ -447,7 +503,7 @@ class DownsamplingEncoderStrict(nn.Module):
 
 class LexatronDownsampled(TacotronLexa):
 
-    def __init__(self, n_vocab, embedding_dim=256, mel_dim=80, linear_dim=1025,
+    def __init__(self, n_vocab, embedding_dim=256, mel_dim=80, num_latentclasses=64, linear_dim=1025,
                  r=5, padding_idx=None, use_memory_mask=False):
 
         super(LexatronDownsampled, self).__init__(n_vocab, embedding_dim=256, mel_dim=80, linear_dim=1025,
@@ -456,13 +512,15 @@ class LexatronDownsampled(TacotronLexa):
         encoder_layers = [
             (2, 4, 1),
             (2, 4, 1),
-            (1, 4, 1),
             (2, 4, 1),
-            (1, 4, 1),
+            (2, 4, 1),
             ]
         self.encoder = DownsamplingEncoderStrict(mel_dim, encoder_layers,use_batchnorm=1)
         self.mel_fc = nn.Linear(mel_dim, 256)
         self.decoder = Decoder_Lexa(mel_dim, r, 68)
+
+        self.upsample_scales = [2,2,2]
+        self.upsample_network = UpsampleNetwork(self.upsample_scales)
 
     def forward(self, targets=None, input_lengths=None, steps=None):
 
@@ -472,7 +530,8 @@ class LexatronDownsampled(TacotronLexa):
 
         encoder_outputs = self.encoder(targets)
         encoder_outputs = torch.tanh(self.mel_fc(encoder_outputs))
-        #print("Shape of targets and encoder outputs: ", targets.shape, encoder_outputs.shape)
+        print("Shape of targets and encoder outputs: ", targets.shape, encoder_outputs.shape)
+        sys.exit()
 
         memory_lengths = None
         tau = anneal_tau(steps)
@@ -489,4 +548,237 @@ class LexatronDownsampled(TacotronLexa):
 
         return mel_outputs, linear_outputs, alignments, tau, entropy, classes
 
+
+
+class LexatronDownsampledVQSoftmax(TacotronOneSeqwise): 
+ 
+    def __init__(self, n_vocab, embedding_dim=256, mel_dim=80, num_latentclasses=64, linear_dim=1025, 
+                 r=5, padding_idx=None, use_memory_mask=False,mel_noise=0): 
+ 
+        super(LexatronDownsampledVQSoftmax, self).__init__(n_vocab, embedding_dim, mel_dim, linear_dim, 
+                 r, padding_idx, use_memory_mask) 
+ 
+        encoder_layers = [ 
+            (2, 4, 1), 
+            (2, 4, 1), 
+            (2, 4, 1), 
+            (2, 4, 1), 
+            ] 
+        self.encoder_downsampling = DownsamplingEncoderStrict(mel_dim, encoder_layers,use_batchnorm=1) 
+        self.mel_fc = nn.Linear(mel_dim, 256) 
+        #self.decoder = Decoder_Lexa(mel_dim, r, 68) 
+        self.num_latentclasses = num_latentclasses
+        self.vq = LexaVQSoftmax(256, self.num_latentclasses)
+        self.mel_noise = mel_noise
+ 
+    def forward(self, targets=None, input_lengths=None, steps=None): 
+ 
+        assert steps is not None 
+ 
+        B = targets.size(0) 
+        memory_lengths = None 
+        tau = anneal_tau(steps) 
+
+        if self.mel_noise:
+             targets = targets * (0.02 * torch.randn(targets.shape).cuda()).exp() + 0.003 * torch.randn_like(targets)
+             if steps == 1:
+                print("Adding mel noise")
+ 
+        encoder_outputs = self.encoder_downsampling(targets) 
+        encoder_outputs = torch.tanh(self.mel_fc(encoder_outputs)) 
+        encoder_outputs, latents, entropy = self.vq(encoder_outputs, tau)
+        encoder_outputs = self.encoder(encoder_outputs) 
+        latents = latents.view(B,-1)
+
+        #print("Shape of encoder outputs and targets: ", encoder_outputs.shape, targets.shape)
+ 
+        mel_outputs, alignments = self.decoder( 
+            encoder_outputs, targets, memory_lengths=memory_lengths) 
+ 
+        mel_outputs = mel_outputs.view(B, -1, self.mel_dim) 
+ 
+        linear_outputs = self.postnet(mel_outputs) 
+        linear_outputs = self.last_linear(linear_outputs) 
+ 
+        return mel_outputs, linear_outputs, alignments, tau, entropy, latents[0]
+ 
+class LexatronDownsampledVQSoftmaxFinalframe(LexatronDownsampledVQSoftmax): 
+       
+    def __init__(self, n_vocab, embedding_dim=256, mel_dim=80, num_latentclasses=64, linear_dim=1025, 
+                 r=5, padding_idx=None, use_memory_mask=False,mel_noise=0): 
+ 
+        super(LexatronDownsampledVQSoftmaxFinalframe, self).__init__(n_vocab, embedding_dim, mel_dim, num_latentclasses, linear_dim, 
+                 r, padding_idx, use_memory_mask, mel_noise) 
+
+        self.decoder = Decoder_TacotronOneFinalFrame(mel_dim, r)  
+
+
+    def generate_latents(self, targets=None, steps=None): 
+        
+        assert steps is not None 
+        
+        B = targets.size(0) 
+        memory_lengths = None 
+        tau = anneal_tau(steps) 
+ 
+        encoder_outputs = self.encoder_downsampling(targets) 
+        encoder_outputs = torch.tanh(self.mel_fc(encoder_outputs)) 
+        encoder_outputs, latents, entropy = self.vq(encoder_outputs, tau)
+
+        return entropy, latents
+
+
+
+class LexatronDownsampledVQConventional(TacotronOneSeqwise): 
+    
+    def __init__(self, n_vocab, embedding_dim=256, mel_dim=80, num_latentclasses=64, linear_dim=1025, 
+                 r=5, padding_idx=None, use_memory_mask=False,normalize_latents=True): 
+ 
+        super(LexatronDownsampledVQConventional, self).__init__(n_vocab, embedding_dim, mel_dim, linear_dim, 
+                 r, padding_idx, use_memory_mask) 
+ 
+        encoder_layers = [ 
+            (2, 4, 1), 
+            (2, 4, 1), 
+            (2, 4, 1), 
+            ] 
+        self.encoder_downsampling = DownsamplingEncoderStrict(mel_dim, encoder_layers,use_batchnorm=1) 
+        self.mel_fc = nn.Linear(mel_dim, 256) 
+        #self.decoder = Decoder_Lexa(mel_dim, r, 68) 
+        self.num_latentclasses = num_latentclasses
+        self.vq = LexaVQSoftmax(256, self.num_latentclasses)
+        self.vq = quantizer_kotha(n_channels=1, n_classes=self.num_latentclasses, vec_len=256, normalize=normalize_latents)  
+        self.decoder = Decoder_TacotronOneFinalFrame(mel_dim, r)  
+
+    def forward(self, targets=None): 
+ 
+ 
+        B = targets.size(0) 
+        memory_lengths = None 
+        
+        encoder_outputs = self.encoder_downsampling(targets) 
+        encoder_outputs = torch.tanh(self.mel_fc(encoder_outputs)) 
+        quantized, vq_penalty, encoder_penalty, entropy, latents = self.vq(encoder_outputs.unsqueeze(2))  
+        latents = latents.view(B,-1)
+        quantized = quantized.squeeze(2)
+        
+        encoder_outputs = self.encoder(quantized) 
+            
+        #print("Shape of encoder outputs and targets: ", encoder_outputs.shape, targets.shape)
+        
+        mel_outputs, alignments = self.decoder( 
+            encoder_outputs, targets, memory_lengths=memory_lengths) 
+ 
+        mel_outputs = mel_outputs.view(B, -1, self.mel_dim) 
+    
+        linear_outputs = self.postnet(mel_outputs) 
+        linear_outputs = self.last_linear(linear_outputs) 
+ 
+        return mel_outputs, linear_outputs, alignments, entropy, latents[0], vq_penalty.mean(), encoder_penalty.mean()
+
+
+class LexatronDownsampledUpsampled(TacotronLexa):
+
+    def __init__(self, n_vocab, embedding_dim=256, mel_dim=80, num_latentclasses=64, linear_dim=1025,
+                 r=5, padding_idx=None, use_memory_mask=False):
+
+        super(LexatronDownsampledUpsampled, self).__init__(n_vocab, embedding_dim=256, mel_dim=80, linear_dim=1025,
+                 r=5, padding_idx=None, use_memory_mask=False)
+
+        encoder_layers = [
+            (2, 4, 1),
+            (2, 4, 1),
+            (2, 4, 1),
+            ]
+        self.encoder = DownsamplingEncoderStrict(mel_dim, encoder_layers,use_batchnorm=1)
+        self.mel_fc = nn.Linear(mel_dim, 256)
+        self.decoder = Decoder_Lexa(mel_dim, r, 68)
+        self.num_latentclasses = num_latentclasses
+        self.vq = LexaVQSoftmax(256, self.num_latentclasses)
+        self.upsample_scales = [2,2,2]
+        self.upsample_network = UpsampleNetwork_r9y9(self.upsample_scales)
+
+        self.decoder_lstm = nn.LSTM(256 , 80, batch_first=True)
+
+    def forward(self, targets=None, input_lengths=None, steps=None):
+
+        assert steps is not None
+
+        B = targets.size(0)
+
+        encoder_outputs = self.encoder(targets)
+        encoder_outputs = torch.tanh(self.mel_fc(encoder_outputs))
+        #print("Shape of targets and encoder outputs: ", targets.shape, encoder_outputs.shape)
+        #sys.exit()
+
+        memory_lengths = None
+        tau = anneal_tau(steps)
+
+        encoder_outputs, latents, entropy = self.vq(encoder_outputs, tau)
+        #print("Shape of targets and encoder outputs: ", targets.shape, encoder_outputs.shape)
+        #print("Latents: ", latents, len(latents.split()), entropy)
+        #sys.exit()
+
+        #targets = targets[:, 1:,:] #0:2]
+        encoder_outputs_upsampled = self.upsample_network(encoder_outputs.transpose(1,2)).transpose(1,2)
+        #print("Shape of targets and upsampled encoder outputs: ", targets.shape, encoder_outputs_upsampled.shape)
+        #decoder_inputs = torch.cat([targets, encoder_outputs_upsampled[:,:-1,:]], dim=-1)
+        decoder_inputs = encoder_outputs_upsampled
+ 
+        mel_outputs, _  = self.decoder_lstm(decoder_inputs)
+        mel_outputs = mel_outputs.view(B, -1, self.mel_dim)
+
+        linear_outputs = self.postnet(mel_outputs)
+        linear_outputs = self.last_linear(linear_outputs)
+ 
+        return mel_outputs, linear_outputs, tau, entropy, latents
+
+
+
+    def forward_generate(self, targets):
+        
+        B = targets.size(0)
+        
+        encoder_outputs = self.encoder(targets)
+        encoder_outputs = torch.tanh(self.mel_fc(encoder_outputs))
+
+        memory_lengths = None
+        tau = 0.1
+
+        encoder_outputs, latents, entropy = self.vq(encoder_outputs, tau)
+        print("Entropy and latents: ", entropy, latents)
+        encoder_outputs_upsampled = self.upsample_network(encoder_outputs.transpose(1,2)).transpose(1,2)
+
+        '''
+        target = torch.zeros(1,1,256).float().cuda()
+        T = encoder_outputs_upsampled.shape[1] - 1
+        hidden = None
+        outputs = []
+        for i in range(T):
+
+           #decoder_inputs = torch.cat([target, encoder_outputs_upsampled[:,T,:].unsqueeze(1)], dim=-1)
+           #decoder_inputs = target
+           decoder_inputs = encoder_outputs_upsampled[:,T,:].unsqueeze(1)
+           mel_outputs, hidden  = self.decoder_lstm(decoder_inputs, hidden)
+           #print("Shape of mel output: ", mel_outputs.shape)
+           target = mel_outputs #[:,:,0:2]
+           outputs += [mel_outputs]
+
+        mel_outputs = torch.stack(outputs)
+        #print("Shape of mel outputs: ", mel_outputs.shape)
+        mel_outputs = mel_outputs.view(B, -1, self.mel_dim)
+       
+        linear_outputs = self.postnet(mel_outputs)
+        linear_outputs = self.last_linear(linear_outputs)
+        '''
+
+        decoder_inputs = encoder_outputs_upsampled
+        
+        mel_outputs, _  = self.decoder_lstm(decoder_inputs)
+        mel_outputs = mel_outputs.view(B, -1, self.mel_dim)
+        
+        linear_outputs = self.postnet(mel_outputs)
+        linear_outputs = self.last_linear(linear_outputs)
+
+        return mel_outputs, linear_outputs
 

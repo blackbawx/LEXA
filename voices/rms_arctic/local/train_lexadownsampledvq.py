@@ -32,7 +32,7 @@ from utils import audio
 from utils.plot import plot_alignment
 from tqdm import tqdm, trange
 from util import *
-from model import LexatronDownsampled as Tacotron
+from model import LexatronDownsampledVQ as Tacotron
 from judith.experiment_tracking import RemoteTracker
 
 
@@ -91,9 +91,9 @@ def train(model, train_loader, val_loader, optimizer,
         for step, (input_lengths, mel, y) in tqdm(enumerate(train_loader)):
 
             # Decay learning rate
-            #current_lr = learning_rate_decay(init_lr, global_step)
-            #for param_group in optimizer.param_groups:
-            #    param_group['lr'] = current_lr
+            current_lr = learning_rate_decay(init_lr, global_step)
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = current_lr
 
             optimizer.zero_grad()
 
